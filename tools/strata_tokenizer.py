@@ -63,6 +63,19 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# The `qwen2` pre-tokenizer (Reflection Beam-1.0's tokenizer.json - Qwen2's, llama.cpp's LLAMA_VOCAB_PRE_TYPE_QWEN2):
+# qwen35's without \p{M} - a combining mark is not a letter (it joins the punctuation run after it), as glm4's - and
+# with a single digit a piece, as qwen35's.
+QWEN2_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 # The `glm4`/`glm5` pre-tokenizer, transcribed from llama-vocab.cpp L406-410 at the vendored pin
 # (LLAMA_VOCAB_PRE_TYPE_CHATGLM4).  Two differences from qwen35, both load-bearing:
 #   * the digit run is `\p{N}{1,3}` - a 4-digit number splits 3+1, not as one whole run;
@@ -141,9 +154,9 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax"):
-            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax"
-                             % pre)
+        if pre not in ("qwen35", "qwen2", "glm4", "glm5", "deepseek3", "minimax"):
+            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, qwen2, glm4, glm5, deepseek3, "
+                             "minimax" % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
         self.ignore_merges = pre in ("glm4", "glm5")
         self.token_types = token_types
@@ -165,8 +178,9 @@ class Tokenizer:
             self.ranks[(parts[0], parts[1])] = i
         self._re = (_IsolatedSplits(DEEPSEEK3_PATTERNS) if pre == "deepseek3" else
                     regex.compile(MINIMAX_PATTERN) if pre == "minimax" else
+                    regex.compile(QWEN2_PATTERN) if pre == "qwen2" else
                     regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN))
-        self._nfc = pre == "minimax"
+        self._nfc = pre in ("minimax", "qwen2")   # (their tokenizer.json normalizer: NFC)
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:

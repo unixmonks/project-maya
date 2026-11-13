@@ -250,4 +250,37 @@ void markov_sample(const float* logits, const float* bias, int V, int* prev, int
                    const float* hidden, int D, const float* embf, int R, float* conf, const SampleArgs& sa, QRow* qo,
                    cudaStream_t s);
 
+// ---- Reflection Beam (Geo::beam)
+
+/// The splits beam_attn takes at most.
+constexpr int kBeamMaxSplits = 64;
+/// beam_attn's part floats for T queries over Hkv groups of G heads in S splits.
+inline size_t beam_part_floats(int T, int Hkv, int G, int S) { return (size_t) T * Hkv * S * G * 130; }
+/// Whether beam_attn reads K / V caches in formats kf / vf (bf16 + bf16, or quantized ones with K's the coarser or
+/// equal: int8 + int8 / fp8 / fp4, fp8 + fp8 / fp4, fp4 + fp4).
+bool beam_kv_pair(int kf, int vf);
+/// out [T][Hq][128] (F32): each query head over its KV group's keys lo .. pos[t] (lo = pos[t] - window + 1, window 0:
+/// every position), softmax(q . k * scale) . v in F32.  The caches in kq's formats (KvQ), a ring of `ring` rows when
+/// ring > 0 (position p at row p % ring - it must hold the window and the call's own new keys).  Hq / Hkv: 4, 6, 8 or
+/// 16.  part (given, beam_part_floats(T, Hkv, Hq / Hkv, splits) floats): the keys in `splits` runs (at most
+/// kBeamMaxSplits), combined in run order.  false: a geometry or cache format not covered (nothing launched).
+bool beam_attn(const float* q, const uint16_t* kc, const uint16_t* vc, const KvQ& kq, const int* pos, int T, int Hq,
+               int Hkv, int window, int ring, float scale, float* out, cudaStream_t s, int splits = 1,
+               float* part = nullptr);
+/// A global (NoPE) layer's queries q [T][per_tok]: times (1 + (pos[t] + 1) / len) ^ pw.
+void beam_qscale(float* q, const int* pos, int T, int per_tok, float pw, float len, cudaStream_t s);
+/// att [T][Hq][hd] *= sigmoid(gl [T][Hq][hd] + gb[head]) - the attention output's per-head gate.
+void beam_gate(float* att, const float* gl, const float* gb, int T, int Hq, int hd, cudaStream_t s);
+/// h = x a + h b over n values (the depth-scaled residual add: x the normed sublayer output).
+void beam_resid(float* h, const float* x, float a, float b, size_t n, cudaStream_t s);
+/// h = silu(g) u over n values into hf and / or FP16 h16 (either may be null).
+void beam_swiglu(const float* g, const float* u, size_t n, float* hf, uint16_t* h16, cudaStream_t s);
+/// x = cap tanh(x / cap) over n values (cap <= 0: nothing).
+void softcap(float* x, size_t n, float cap, cudaStream_t s);
+/// The router over logits [T][E] (F32, E <= 256): s = sigmoid, chosen by s + bias within the tg of ng expert groups
+/// whose two largest s + bias sum the highest (ng <= 1 or tg >= ng: every expert), the K largest (ties: the lower
+/// expert) -> top [T][K], weights s / sum over the chosen -> w [T][K].
+void beam_route(const float* logits, const float* bias, int T, int E, int K, int ng, int tg, int* top, float* w,
+                cudaStream_t s);
+
 }  // namespace mm3::k

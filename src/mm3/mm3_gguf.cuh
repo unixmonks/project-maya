@@ -60,6 +60,9 @@ size_t scratch_bytes();
 /// each shape's fastest kernel measured on this GPU at its first product (src/ds4/ds4_lt; the picks kept in
 /// set_lt_store's file) - an AMD build with hipBLASLt only, else the BLAS.  The prefill calibration chooses.
 void set_gemm(int backend);
+/// The routed experts' activation: silu(g) u, unclamped (Reflection Beam's) instead of MiniMax's swigluoai - for the
+/// whole process (one model a process), before the first forward.
+void set_plain_swiglu(bool on);
 int gemm_backend();
 bool gemm_lt_available();
 void set_lt_store(const char* path);

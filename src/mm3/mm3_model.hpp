@@ -170,6 +170,10 @@ public:
     int max_ctx() const;
     int bos() const;
     int eos() const;
+    /// The tokens a reply ends at: eos(), and Beam's <|call|>.
+    std::vector<int> eos_ids() const;
+    /// The model's name for the server (INFO model=): MiniMax-M3.1-Flash, or Beam-1.0 (Geo::beam).
+    const char* model_name() const;
     const Stats& stats() const;
     std::vector<std::string> info_lines() const;
     /// The Monitor's map of each GPU (serve/gpu_map.py's VRAM lines): what each part holds there, measured at the load.

@@ -551,6 +551,10 @@ struct TpEngine::Impl {
         o = o_;
         const double t0 = now();
         if (!pk.load(o.pack, err) || !g.read(pk, err)) return false;
+        if (g.beam) {   // (Reflection Beam: the layer split only - Model::load takes it instead, with a NOTE)
+            err = "Beam has no tensor-parallel path";
+            return false;
+        }
         if (const char* pr = ::mm3::env("MM3_PROMOTE"))
             std::sscanf(pr, "%f,%d,%f", &kPromote, &kMaxPending, &kDecay);
         tp = o.tp;

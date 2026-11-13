@@ -314,8 +314,9 @@ void serve_header(mm3::Model& m, bool spec_on, const std::string& kv_fmt) {
     for (const std::string& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     for (const std::string& l : m.vram_lines()) std::printf("%s\n", l.c_str());   // (the Monitor's GPU map)
     const auto& st0 = m.stats();
-    std::printf("INFO engine=mm3 engine_kind=mm3 model=MiniMax-M3.1-Flash experts_vram=%ld experts=%ld "
-                "expert_slots=%ld ram_slots=%ld dspark=%d kv=%s cpu_threads=%d cpu_experts=%ld ctx=%d", st0.resident,
+    std::printf("INFO engine=mm3 engine_kind=mm3 model=%s experts_vram=%ld experts=%ld "
+                "expert_slots=%ld ram_slots=%ld dspark=%d kv=%s cpu_threads=%d cpu_experts=%ld ctx=%d", m.model_name(),
+                st0.resident,
                 st0.experts, st0.resident, st0.pooled, m.draft_block() > 0 && spec_on ? 1 : 0, kv_fmt.c_str(),
                 st0.cpu_threads, st0.experts - st0.resident, m.max_ctx());
     if (st0.kv_ring > 0) std::printf(" kv_resident=%d", st0.kv_ring);   // (KV streaming: a layer's positions in VRAM)
@@ -1925,7 +1926,7 @@ int main(int argc, char** argv) {
         return score_main(m, score_path, ref_out);
     }
     if (serve_mode) {
-        std::vector<int> eos = eos_arg.empty() ? std::vector<int>{m.eos()} : parse_list(eos_arg);
+        std::vector<int> eos = eos_arg.empty() ? m.eos_ids() : parse_list(eos_arg);
         const std::string kvf = o.kv_k == o.kv_v ? std::string(mm3::k::kv_name(o.kv_k))
                                                  : std::string(mm3::k::kv_name(o.kv_k)) + "," + mm3::k::kv_name(o.kv_v);
         if (m.seqs() > 1) return serve_multi(m, eos, o.chunk, kvf, profile_out);

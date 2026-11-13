@@ -73,5 +73,7 @@ void gg_run(CpuLane& lane, int dim, int ff, float limit, const std::vector<CpuEx
 void gg_run_multi(CpuLane& lane, int dim, int ff, float limit, const std::vector<CpuExpert>& ex,
                   const std::vector<std::vector<std::pair<int, float>>>& users, const float* x, int T, float* out,
                   const std::vector<std::pair<int, int>>* order = nullptr, bool accumulate = false);
+/// The GGUF lane's activation for the whole process: silu(g) u, unclamped (Reflection Beam's) instead of swigluoai.
+void gg_set_plain_swiglu(bool on);
 
 }  // namespace mm3

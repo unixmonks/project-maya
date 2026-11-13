@@ -48,7 +48,11 @@ class ChatTemplate:
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
-        self.template = env.from_string(self.source)
+        # transformers' {% generation %} ... {% endgeneration %} (assistant masks for training; Reflection Beam's
+        # template has them) render their body as it is: plain blocks here, whitespace control kept
+        src = re.sub(r"\{%(-?)\s*generation\s*(-?)%\}", r"{%\1 if true \2%}", self.source)
+        src = re.sub(r"\{%(-?)\s*endgeneration\s*(-?)%\}", r"{%\1 endif \2%}", src)
+        self.template = env.from_string(src)
         # GLM-5.x: the template knows reasoning_effort "low" and "high" only - anything else, an absent one included,
         # is "Max", its most verbose - and it always opens <think> (no enable_thinking).  The server's levels are
         # GLM's own (low / high / max, or thinking off: the think block closed the way the template writes a turn
@@ -60,6 +64,10 @@ class ChatTemplate:
         # MiniMax-M3.1 (tools/mm3/chat_template.jinja: MiniMax's own plus thinking_mode "disabled"): reasoning_effort
         # low .. max; <mm:think> reasoning and ]<]minimax[>[-tagged tool calls (OutputParser(minimax=True) reads them)
         self.minimax = MINIMAX_NS in self.source
+        # Reflection Beam-1.0 (harmony_xml: tools/mm3/beam_chat_template.jinja): channels analysis (reasoning) and final
+        # (the answer), tool calls as `to=NAME` messages of <rfl:parameter> elements (OutputParser(beam=True) reads them);
+        # reasoning_effort minimal .. max (thinking off: minimal - Beam always opens its analysis channel)
+        self.beam = BEAM_PARAM in self.source and "<|channel|>" in self.source
         # CYBER-FROST-3.8-PS (a Qwen3.8 template that sets enable_thinking = true itself): it opens <think> whatever it
         # is told.  Thinking off (a client's, or a forced tool call's) closes the block the way its Qwen base's template
         # writes thinking off - <think>\n\n</think>\n\n - so the prompt and the server's parser agree
@@ -67,7 +75,8 @@ class ChatTemplate:
         # A Qwen3.x template (Qwen3.8-Flash-Next's - unsloth's GGUF copy - and CYBER-FROST's): it writes each tool as
         # `tool | tojson`, and Qwen's reference render (transformers' apply_chat_template, the pack's chat_golden.json)
         # gets the tools in OpenAI's form - {"type": "function", "function": {...}} - so that is how they go in.
-        self.qwen = (not self.glm_effort and not self.deepseek and not self.minimax and "<|im_start|>" in self.source
+        self.qwen = (not self.glm_effort and not self.deepseek and not self.minimax and not self.beam and
+                     "<|im_start|>" in self.source
                      and "<function=" in self.source and "tool | tojson" in self.source)
         # ... and it keeps a past turn's thinking (reasoning_content) unless told preserve_thinking=false: a client that
         # sends the reasoning back gets the conversation as the model wrote it (the engine then goes on from it)
@@ -129,6 +138,28 @@ class ChatTemplate:
             # (its template reads tool.function: the server's flat tools go back into OpenAI's form)
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
+                                        **kwargs)
+        if self.beam:
+            off = kwargs.pop("enable_thinking", None) is False
+            level = name or kwargs.pop("reasoning_effort", None)
+            kwargs.pop("reasoning_effort", None)
+            kwargs.pop("thinking_mode", None)
+            if off:
+                kwargs["reasoning_effort"] = "minimal"
+            elif level in EFFORT_NAMES or level == "minimal":
+                kwargs["reasoning_effort"] = level
+            tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
+            # (its template names a tool result's sender - <|start|>NAME to=assistant - from the message's name or its
+            #  call's id; the server's messages carry neither: each result takes the name of the call it answers, the
+            #  calls of the assistant turn before it in order)
+            named, pending = [], []
+            for m in messages:
+                if m.get("role") == "assistant" and m.get("tool_calls"):
+                    pending = [(c.get("function") or c).get("name") for c in m["tool_calls"]]
+                elif m.get("role") == "tool" and not m.get("name") and not m.get("tool_call_id") and pending:
+                    m = {**m, "name": pending.pop(0)}
+                named.append(m)
+            return self.template.render(messages=named, tools=tools, add_generation_prompt=add_generation_prompt,
                                         **kwargs)
         off = False
         if self.glm_effort:
@@ -1261,13 +1292,131 @@ class MinimaxRewriter:
         return {n: v for n, v in items}
 
 
+BEAM_START, BEAM_END, BEAM_MSG, BEAM_CHAN = "<|start|>", "<|end|>", "<|message|>", "<|channel|>"
+BEAM_RETURN, BEAM_CALL = "<|return|>", "<|call|>"
+BEAM_PARAM, BEAM_PARAM_END = '<rfl:parameter name="', "</rfl:parameter>"
+
+
+class BeamRewriter:
+    """Reflection Beam-1.0's output (harmony_xml: its tokenizer_config.json's response_template) rewritten, as it
+    streams, into what OutputParser reads.  The output is messages - a header up to <|message|> (`<|channel|>analysis`,
+    `<|channel|>final`, or ` to=NAME<|channel|>analysis <|constrain|>xml` for a tool call), a body up to <|end|>,
+    <|return|> or <|call|>, the next message's header after <|start|>assistant; the server's prompt ends with
+    <|start|>assistant, so the output opens with a header.  An analysis message is reasoning (THINK_AGAIN: the parser
+    reopens its reasoning after an answer part, and drops it while it is in it already); a final one the answer (</think>
+    first when reasoning was open); a tool call `<tool_call><function=NAME>` with each `<rfl:parameter name="K">\nV\n
+    </rfl:parameter>` as Qwen's `<parameter=K>\nV\n</parameter>` (a parameter left open ends at the next one), then
+    `</function></tool_call>` - Qwen's form, its values decoded by the tool's schema.  A tag split across deltas is
+    held until it is whole."""
+
+    MARKS = (BEAM_START, BEAM_END, BEAM_MSG, BEAM_RETURN, BEAM_CALL, BEAM_PARAM, BEAM_PARAM_END)
+
+    def __init__(self, thinking: bool = True):
+        self.buf = ""
+        self.mode = "header"         # header (up to <|message|>) -> body -> between (up to <|start|>) -> header ...
+        self.reasoning = thinking    # whether the parser is in reasoning now
+        self.call = False            # the body is a tool call's
+        self.param = False           # ... and a parameter of it is open
+        self.pname = None            # a parameter's name being read (after BEAM_PARAM, up to its `">`)
+
+    def feed(self, text: str) -> str:
+        self.buf += text
+        out = []
+        while self.buf:
+            if self.mode == "header":
+                i = self.buf.find(BEAM_MSG)
+                if i < 0:
+                    break                               # the header is not whole yet
+                out.append(self._open(self.buf[:i]))
+                self.buf = self.buf[i + len(BEAM_MSG):]
+                self.mode = "body"
+                continue
+            if self.mode == "between":
+                i = self.buf.find(BEAM_START)
+                if i < 0:
+                    keep = max((n for n in range(1, len(BEAM_START)) if self.buf.endswith(BEAM_START[:n])), default=0)
+                    self.buf = self.buf[len(self.buf) - keep:]   # (between messages: nothing but whitespace)
+                    break
+                self.buf = self.buf[i + len(BEAM_START):]
+                self.mode = "header"
+                continue
+            if self.pname is not None:                  # a parameter's name: up to its `">`
+                j = self.buf.find('">')
+                if j < 0:
+                    break
+                out.append("<parameter=" + self.buf[:j] + ">")
+                self.buf, self.pname, self.param = self.buf[j + 2:], None, True
+                continue
+            hits = [(i, m) for m in self.MARKS for i in (self.buf.find(m),) if i >= 0]
+            if not hits:
+                keep = max((n for m in self.MARKS for n in range(1, len(m)) if self.buf.endswith(m[:n])), default=0)
+                out.append(self.buf[:len(self.buf) - keep])
+                self.buf = self.buf[len(self.buf) - keep:]
+                break
+            i, m = min(hits)
+            if i:
+                out.append(self.buf[:i])
+            self.buf = self.buf[i + len(m):]
+            if m == BEAM_PARAM:
+                if not self.call:
+                    out.append(m)                       # (outside a call: text)
+                    continue
+                if self.param:
+                    out.append("</parameter>")
+                self.pname = ""
+            elif m == BEAM_PARAM_END:
+                if self.call and self.param:
+                    out.append("</parameter>")
+                    self.param = False
+                elif not self.call:
+                    out.append(m)
+            elif m == BEAM_START:                       # (a body that runs into the next header: it ends here)
+                out.append(self._close())
+                self.mode = "header"
+            else:                                       # <|end|>, <|return|>, <|call|>: the message ends
+                out.append(self._close())
+                self.mode = "between"
+        return "".join(out)
+
+    def finish(self) -> str:
+        rest, self.buf = self.buf, ""
+        out = "" if self.mode == "between" else rest
+        if self.mode == "body" and self.pname is not None:
+            out = "<parameter=" + rest
+            self.pname, self.param = None, True
+        return out + self._close()
+
+    def _open(self, header: str) -> str:
+        to = re.search(r"\bto=([^\s<]+)", header)
+        chan = re.search(r"<\|channel\|>\s*(\w+)", header)
+        if to:
+            self.call = True
+            out = "</think>" if self.reasoning else ""
+            self.reasoning = False
+            return out + "<tool_call><function=" + to.group(1) + ">"
+        if chan and chan.group(1) == "analysis":
+            self.reasoning = True
+            return THINK_AGAIN
+        out = "</think>" if self.reasoning else ""      # final (or a channel Beam does not name: the answer)
+        self.reasoning = False
+        return out
+
+    def _close(self) -> str:
+        if not self.call:
+            return ""
+        out = ("</parameter>" if self.param else "") + "</function></tool_call>"
+        self.call = self.param = False
+        self.pname = None
+        return out
+
+
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False,
-                 token_only_end: bool = False, unions: bool = False):
+                 token_only_end: bool = False, unions: bool = False, beam: bool = False):
         self.state = "reasoning" if thinking else "content"
         # token_only_end: the vocabulary has the end of thinking as a token (DeepSeek's), so only that token closes the
         # reasoning - the text "</think>" in it does not (a model that quotes the tag while it talks about it, as in
@@ -1278,7 +1427,8 @@ class OutputParser:
         self.unions = unions   # GLM-5.3 (glm_dsa): a parameter whose schema allows a string stays one (_declared_type)
         # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter); MiniMax-M3.1's the same way (MinimaxRewriter):
         # both send JSON values, so the parser takes them without the tools' schemas
-        self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else None
+        self.dsml = (DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else
+                     BeamRewriter(self.state == "reasoning") if beam else None)
         self.buf = ""
         self._call_resume = 0        # where the CALL_END search in call state resumes (see _feed)
         self.lead = False

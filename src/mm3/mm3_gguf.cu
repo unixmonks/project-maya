@@ -25,6 +25,7 @@ namespace iq = strata::ds4::gguf::iq;
 namespace {
 
 std::atomic<int> g_errors{0};
+std::atomic<int> g_plain{0};   // set_plain_swiglu: the experts' activation silu(g) u (Beam) instead of swigluoai
 std::atomic<int> g_gemm{0};   // set_gemm's backend: 0 the BLAS, 1 hipBLASLt (measured kernels) where it runs
 
 void check(const char* what) {
@@ -286,7 +287,7 @@ bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq:
     ia.limit = limit;
     ia.tg = lay.gg_type[0];
     ia.td = lay.gg_type[2];
-    ia.act = iq::kActOai;
+    ia.act = g_plain.load(std::memory_order_relaxed) ? iq::kActSwiglu : iq::kActOai;
     ia.tu = lay.gg_type[1] != lay.gg_type[0] ? lay.gg_type[1] : 0;
     if (lay.fmt != kFmtGG || !iq::supported(lay.gg_type[0]) || !iq::supported(lay.gg_type[1]) ||
         !iq::supported(lay.gg_type[2])) {
@@ -323,6 +324,7 @@ size_t row_bytes(int t, int64_t k) {
 }
 
 bool prepare(cudaStream_t s) { return scratch(s) != nullptr; }
+void set_plain_swiglu(bool on) { g_plain.store(on ? 1 : 0); }
 void set_gemm(int backend) { g_gemm.store(backend == 1 && gemm_lt_available() ? 1 : 0); }
 int gemm_backend() { return g_gemm.load(); }
 bool gemm_lt_available() {

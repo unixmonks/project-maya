@@ -314,6 +314,9 @@ def config_label(cfg: dict) -> str | None:
     None for a config the setup did not write."""
     if not isinstance(cfg.get("installer"), dict):
         return None
+    if cfg["installer"].get("beam"):   # (Reflection Beam on maya-mm3: tools/mm3/beam_setup.py's config)
+        what = cfg["installer"].get("quant_name")
+        return "Beam-1.0" + (SEP + what if what else "")
     if is_glm53(cfg):
         what = glm53_quant(config_key(cfg))
         return _g53.LABEL + (SEP + what if what else "")

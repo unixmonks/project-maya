@@ -2438,7 +2438,11 @@ class Service:
                             # DeepSeek-V4.1 ends a turn with its EOS (and would start the next with <｜User｜>)
                             _special_ids("<｜end▁of▁sentence｜>") + _special_ids("<｜User｜>") +
                             # MiniMax-M3.1 with [e~[ (and would start the next turn with ]~b])
-                            _special_ids("[e~[") + _special_ids("]~b]"))
+                            _special_ids("[e~[") + _special_ids("]~b]") +
+                            # Reflection Beam-1.0 with <|return|> (an answer) or <|call|> (tool calls) - its <|end|>
+                            # only ends a message within the turn
+                            (_special_ids("<|return|>") + _special_ids("<|call|>")
+                             if getattr(template, "beam", False) else []))
         # DeepSeek's turn openers: where its last user turn starts and its system prompt ends (MAYA_DS4_RESTORE_POINTS)
         self.ds_user_id = (_special_ids("<｜User｜>") or [None])[0]
         self.ds_system_id = (_special_ids("<｜System｜>") or [None])[0]
@@ -2457,13 +2461,17 @@ class Service:
         self.think_budget_max = 0
         # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
         end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else _special_ids("</think>")
-        self.think_end_id = end[0] if end else None
+        # (Beam's vocabulary has a </think> it never writes: its reasoning ends with its final channel's header - no
+        #  token the server could close it with)
+        self.think_end_id = end[0] if end and not getattr(template, "beam", False) else None
         # the tokens the engine itself ends a request at, whatever the server does (see THINK_RESTARTS): a pack
         # tokenizer that names its "eos" (DeepSeek's, MiniMax's: their engines' --eos default) ends there only; the
         # GLM/Qwen engine ends at every turn-end token of its vocabulary (GLM: <|endoftext|>, <|user|>,
         # <|observation|>), and its tokenizer names them by their GGUF keys - all of stop_ids then
         sid = getattr(tokenizer, "special_ids", None) or {}
         self.eos_ids = {sid["eos"]} if isinstance(sid.get("eos"), int) else set(self.stop_ids)
+        if isinstance(sid.get("eos2"), int):   # (a second end: Beam's <|call|> beside its <|return|>)
+            self.eos_ids.add(sid["eos2"])
         # the special literals that stay text inside a message (frontend.mark_literals): every one the vocabulary has
         self.literals = literal_tags(getattr(tokenizer, "special_tokens", None))
 
@@ -4254,6 +4262,7 @@ class Service:
                                 stream_tools=True, dsml=getattr(self.template, "deepseek", False),
                                 token_only_end=getattr(self.template, "deepseek", False) and self.think_end_id is not None,
                                 minimax=getattr(self.template, "minimax", False),
+                                beam=getattr(self.template, "beam", False),
                                 strict_tools=responses, single_tool=single_tool,
                                 unions=getattr(self.template, "glm_dsa", False))
         parser = new_parser()

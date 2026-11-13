@@ -678,11 +678,13 @@ __device__ __forceinline__ uint32_t bf2pack(float a, float b) {
 
 // one operand's tile (64 keys of KV group g from k0 on, keys past p zero) into shared memory: BF16 rows in t16 - FP8 /
 // FP4 rows decoded on the way (exact: their values are BF16 values) - or (F kKvI8) int8 rows in t8 and their scales in
-// tsc.  c16: the BF16 cache, cq / sq: the format's codes and scales (VRAM; host: hc16, hcq, hsq)
+// tsc.  c16: the BF16 cache, cq / sq: the format's codes and scales (VRAM; host: hc16, hcq, hsq).  ring > 0 (Beam's
+// sliding layers): the cache a ring of that many rows, key kp at row kp % ring (no KV streaming then)
 template <int F, int NT = 128>
 __device__ __forceinline__ void load_tile(int k0, int p, int g, int Hkv, const KvHost& hs, bool is_k,
                                           const uint16_t* c16, const uint8_t* cq, const uint8_t* sq,
-                                          uint16_t (*t16)[kRow], int8_t (*t8)[2 * kRow], float* tsc) {
+                                          uint16_t (*t16)[kRow], int8_t (*t8)[2 * kRow], float* tsc,
+                                          int ring = 0) {
     const int tid = threadIdx.x;
     const uint16_t* h16 = is_k ? hs.kc : hs.vc;
     const uint8_t* hcq = is_k ? hs.q.kc : hs.q.vc;
@@ -694,7 +696,7 @@ __device__ __forceinline__ void load_tile(int k0, int p, int g, int Hkv, const K
             uint32_t w = 0;
             if (kp <= p) {
                 bool fh = false;
-                const size_t r = kv_row(hs, kp, fh);
+                const size_t r = ring > 0 ? (size_t) (kp % ring) : kv_row(hs, kp, fh);
                 w = *(const uint32_t*) ((fh ? h16 : c16) + (r * Hkv + g) * 128 + c * 2);
             }
             *(uint32_t*) &t16[j][c * 2] = w;
@@ -706,7 +708,7 @@ __device__ __forceinline__ void load_tile(int k0, int p, int g, int Hkv, const K
             uint32_t w = 0;
             if (kp <= p) {
                 bool fh = false;
-                const size_t r = kv_row(hs, kp, fh);
+                const size_t r = ring > 0 ? (size_t) (kp % ring) : kv_row(hs, kp, fh);
                 w = *(const uint32_t*) ((fh ? hcq : cq) + (r * Hkv + g) * 128 + c * 4);
             }
             *(uint32_t*) &t8[j][c * 4] = w;
@@ -716,7 +718,7 @@ __device__ __forceinline__ void load_tile(int k0, int p, int g, int Hkv, const K
             float a = 0.0f;
             if (kp <= p) {
                 bool fh = false;
-                const size_t r = kv_row(hs, kp, fh);
+                const size_t r = ring > 0 ? (size_t) (kp % ring) : kv_row(hs, kp, fh);
                 a = *(const float*) ((fh ? hsq : sq) + (r * Hkv + g) * 4);
             }
             tsc[tid] = a;
@@ -728,7 +730,7 @@ __device__ __forceinline__ void load_tile(int k0, int p, int g, int Hkv, const K
             uint32_t w = 0, sb = 0;
             if (kp <= p) {
                 bool fh = false;
-                const size_t r = kv_row(hs, kp, fh);
+                const size_t r = ring > 0 ? (size_t) (kp % ring) : kv_row(hs, kp, fh);
                 w = *(const uint32_t*) ((fh ? hcq : cq) + (r * Hkv + g) * 128 + c * 4);
                 sb = (fh ? hsq : sq)[(r * Hkv + g) * 4 + (c >> 3)];
             }
@@ -744,7 +746,7 @@ __device__ __forceinline__ void load_tile(int k0, int p, int g, int Hkv, const K
             uint32_t w = 0, sb = 0;
             if (kp <= p) {
                 bool fh = false;
-                const size_t r = kv_row(hs, kp, fh);
+                const size_t r = ring > 0 ? (size_t) (kp % ring) : kv_row(hs, kp, fh);
                 w = *(const uint32_t*) ((fh ? hcq : cq) + (r * Hkv + g) * 64 + c * 4);
                 sb = (fh ? hsq : sq)[(r * Hkv + g) * 8 + (c >> 1)];
             }
@@ -2613,6 +2615,402 @@ void markov_pick(const float* logits, const float* bias, int V, int* prev, int* 
                  const float* b, const float* hidden, int D, const float* embf, int R, float* conf, cudaStream_t s) {
     markov_pick_kernel<<<1, 1024, 0, s>>>(logits, bias, V, prev, out, biased, w, b, hidden, D, embf, R, conf);
     check("markov_pick");
+}
+
+
+// ================================================================== Reflection Beam (Geo::beam: model_type beam)
+// Beam-1.0-501B-A23B's own operations beside the shared ones (rms, qk_norm_rope, the experts): grouped-query attention
+// over a causal range of keys - a sliding layer's last `window` positions in a ring, a global layer's every position -
+// the per-head sigmoid gate on its output, the global layers' NoPE query scale, the depth-scaled residual, the plain
+// SwiGLU, the group-limited sigmoid router and the final logit softcap.  The arithmetic follows transformers'
+// modular_beam.py (llama.cpp's src/models/beam.cpp the same), in F32.
+namespace {
+
+// one block of 128 threads per (query t, KV group g, split z): the group's G query heads over the keys lo .. p
+// (lo = p - window + 1 for a sliding layer, 0 for a global one) in 64-key tiles, online softmax in F32 as
+// sparse_attn_kernel's; the caches in kq's formats (load_tile), a ring of `ring` rows when ring > 0.  S > 1: split z
+// takes its share of the tiles and leaves its sums, max and total in part [T][Hkv][S][G][kPart] for beam_combine.
+template <int G, int KF, int VF>
+__global__ void __launch_bounds__(128) beam_attn_kernel(const float* q, const uint16_t* kc, const uint16_t* vc,
+                                                        const int* pos, int Hq, int Hkv, int window, int ring,
+                                                        float scale, float* out, KvQ kq, int S, float* part) {
+    constexpr int HS = (G + 1) / 2;   // (scores: heads a thread)
+    __shared__ float qs[G][128];
+    __shared__ __align__(4) uint16_t ks[kTile][kRow], vs[kTile][kRow];
+    __shared__ float ksc[kTile], vsc[kTile];
+    int8_t (*k8)[2 * kRow] = (int8_t (*)[2 * kRow]) ks;
+    int8_t (*v8)[2 * kRow] = (int8_t (*)[2 * kRow]) vs;
+    __shared__ float sc[G][kTile + 1];
+    __shared__ float mrow[G], lrow[G], arow[G];
+    const int t = blockIdx.x, g = blockIdx.y, z = blockIdx.z, tid = threadIdx.x, lane = tid & 31, wp = tid >> 5;
+    const int p = pos[t];
+    const int lo = window > 0 ? max(0, p - window + 1) : 0;
+    const int k_first = lo / kTile * kTile;
+    const int ntile = (p - k_first) / kTile + 1;
+    const int per = (ntile + S - 1) / S;
+    const int t0 = z * per, t1 = min(ntile, t0 + per);
+    const bool krot = KF != kKvBf16 && (kq.rot & 1), vrot = VF != kKvBf16 && (kq.rot & 2);
+    for (int i = tid; i < G * 128; i += 128) {
+        const int h = i / 128, d = i % 128;
+        qs[h][d] = q[((size_t) t * Hq + g * G + h) * 128 + d] * scale;
+    }
+    if (krot) {   // (the queries rotated as the keys)
+        __syncthreads();
+        for (int h = wp; h < G; h += 4) {
+            float x[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) x[i] = qs[h][lane * 4 + i];
+            had128w(x, lane);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) qs[h][lane * 4 + i] = x[i];
+        }
+    }
+    if (tid < G) {
+        mrow[tid] = -INFINITY;
+        lrow[tid] = 0.0f;
+    }
+    float acc[G];
+#pragma unroll
+    for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+    const KvHost nh{};
+    for (int ti = t0; ti < t1; ++ti) {
+        const int k0 = k_first + ti * kTile;
+        __syncthreads();
+        load_tile<KF>(k0, p, g, Hkv, nh, true, kc, kq.kc, kq.ks, ks, k8, ksc, ring);
+        load_tile<VF>(k0, p, g, Hkv, nh, false, vc, kq.vc, kq.vs, vs, v8, vsc, ring);
+        __syncthreads();
+        {   // scores: thread (j = tid % 64) for the heads (tid / 64) * HS .. + HS
+            const int j = tid & 63, h0 = (tid >> 6) * HS;
+            const int kp = k0 + j;
+            const bool ok = kp >= lo && kp <= p;
+            float s8[HS];
+#pragma unroll
+            for (int h = 0; h < HS; ++h) s8[h] = 0.0f;
+            if (ok) {
+#pragma unroll 4
+                for (int d = 0; d < 128; ++d) {
+                    const float kv = KF == kKvI8 ? (float) k8[j][d] : bf2f(ks[j][d]);
+#pragma unroll
+                    for (int h = 0; h < HS; ++h)
+                        if (h0 + h < G) s8[h] = fmaf(qs[h0 + h][d], kv, s8[h]);
+                }
+                if constexpr (KF == kKvI8) {
+#pragma unroll
+                    for (int h = 0; h < HS; ++h) s8[h] *= ksc[j];
+                }
+            }
+#pragma unroll
+            for (int h = 0; h < HS; ++h)
+                if (h0 + h < G) sc[h0 + h][j] = ok ? s8[h] : -INFINITY;
+        }
+        __syncthreads();
+        if (tid < G) {   // the row's new max, the old sum's factor, the tile's probabilities
+            const int h = tid;
+            float m = mrow[h];
+            for (int j = 0; j < kTile; ++j) m = fmaxf(m, sc[h][j]);
+            const float a = mrow[h] == -INFINITY ? 0.0f : expf(mrow[h] - m);
+            float l = lrow[h] * a;
+            for (int j = 0; j < kTile; ++j) {
+                const float e = sc[h][j] == -INFINITY ? 0.0f : expf(sc[h][j] - m);
+                sc[h][j] = e;
+                l += e;
+            }
+            mrow[h] = m;
+            lrow[h] = l;
+            arow[h] = a;
+        }
+        __syncthreads();
+        {   // the values: thread d over the G heads
+            const int d = tid;
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                float sv = acc[h] * arow[h];
+                if constexpr (VF == kKvI8) {
+                    for (int j = 0; j < kTile; ++j) sv = fmaf(sc[h][j] * vsc[j], (float) v8[j][d], sv);
+                } else {
+                    for (int j = 0; j < kTile; ++j) sv = fmaf(sc[h][j], bf2f(vs[j][d]), sv);
+                }
+                acc[h] = sv;
+            }
+        }
+    }
+    __syncthreads();
+    if (S > 1) {
+        float* pz = part + (((size_t) t * Hkv + g) * S + z) * G * kPart;
+#pragma unroll
+        for (int h = 0; h < G; ++h) pz[h * kPart + tid] = acc[h];
+        if (tid < G) {
+            pz[tid * kPart + 128] = mrow[tid];
+            pz[tid * kPart + 129] = lrow[tid];
+        }
+        return;
+    }
+    if (!vrot) {
+#pragma unroll
+        for (int h = 0; h < G; ++h)
+            out[((size_t) t * Hq + g * G + h) * 128 + tid] = lrow[h] > 0.0f ? acc[h] / lrow[h] : 0.0f;
+        return;
+    }
+#pragma unroll
+    for (int h = 0; h < G; ++h) qs[h][tid] = lrow[h] > 0.0f ? acc[h] / lrow[h] : 0.0f;
+    __syncthreads();
+    for (int h = wp; h < G; h += 4) {
+        float x[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) x[i] = qs[h][lane * 4 + i];
+        had128w(x, lane);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) out[((size_t) t * Hq + g * G + h) * 128 + lane * 4 + i] = x[i];
+    }
+}
+
+// beam_attn_kernel's S partials of (t, g) -> out, head blockIdx.z: the splits' max, each split's sums and total scaled to
+// it, added in split order (rot: the row back through H)
+__global__ void __launch_bounds__(128) beam_combine_kernel(const float* part, int Hq, int Hkv, int G, int S, bool rot,
+                                                           float* out) {
+    __shared__ float o[128];
+    const int t = blockIdx.x, g = blockIdx.y, h = blockIdx.z, d = threadIdx.x;
+    const float* pt = part + ((size_t) t * Hkv + g) * S * G * kPart;
+    float M = -INFINITY;
+    for (int z = 0; z < S; ++z) M = fmaxf(M, pt[((size_t) z * G + h) * kPart + 128]);
+    float L = 0.0f, a = 0.0f;
+    if (M != -INFINITY)
+        for (int z = 0; z < S; ++z) {
+            const float* pr = pt + ((size_t) z * G + h) * kPart;
+            const float m = pr[128];
+            const float f = m == -INFINITY ? 0.0f : expf(m - M);
+            L = fmaf(pr[129], f, L);
+            a = fmaf(pr[d], f, a);
+        }
+    const float v = L > 0.0f ? a / L : 0.0f;
+    float* orow = out + ((size_t) t * Hq + g * G + h) * 128;
+    if (!rot) {
+        orow[d] = v;
+        return;
+    }
+    o[d] = v;
+    __syncthreads();
+    if (d < 32) {
+        float x[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) x[i] = o[d * 4 + i];
+        had128w(x, d);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) orow[d * 4 + i] = x[i];
+    }
+}
+
+// a global layer's queries: q *= (1 + (p + 1) / len) ^ pw (transformers' compute_attention_scaling, in F32)
+__global__ void beam_qscale_kernel(float* q, const int* pos, int per_tok, float pw, float len) {
+    const int t = blockIdx.x;
+    const float f = expf(pw * log1pf(((float) pos[t] + 1.0f) / len));
+    float* r = q + (size_t) t * per_tok;
+    for (int i = threadIdx.x; i < per_tok; i += blockDim.x) r[i] *= f;
+}
+
+// att [T][Hq][hd] *= sigmoid(gl [T][Hq][hd] + gb[head])
+__global__ void beam_gate_kernel(float* att, const float* gl, const float* gb, size_t n, int Hq, int hd) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const int h = (int) ((i / (size_t) hd) % (size_t) Hq);
+        att[i] *= 1.0f / (1.0f + expf(-(gl[i] + gb[h])));
+    }
+}
+
+// h = x a + h b (the depth-scaled residual: x the normed sublayer output)
+__global__ void beam_resid_kernel(float* h, const float* x, float a, float b, size_t n) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+        h[i] = x[i] * a + h[i] * b;
+}
+
+// h = silu(g) u (the dense layers' SwiGLU: no clamp, no alpha)
+__global__ void beam_swiglu_kernel(const float* g, const float* u, size_t n, float* hf, uint16_t* h16) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const float gv = g[i];
+        const float v = gv / (1.0f + expf(-gv)) * u[i];
+        if (hf) hf[i] = v;
+        if (h16) h16[i] = f2h(v);
+    }
+}
+
+// x = cap tanh(x / cap)
+__global__ void softcap_kernel(float* x, size_t n, float cap) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+        x[i] = cap * tanhf(x[i] / cap);
+}
+
+// the router (one warp a token, E <= 256): s = sigmoid(logit), chosen by s + bias among the experts of the tg groups
+// (ng of E / ng experts each) whose two largest s + bias sum the highest (ties: the lower group), the K largest
+// (ties: the lower expert) - weights s / their sum.  ng <= 1 or tg >= ng: route_kernel's choice.
+__global__ void beam_route_kernel(const float* logits, const float* bias, int T, int E, int K, int ng, int tg,
+                                  int* top, float* w) {
+    const int t = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (t >= T) return;
+    float sg[8], ch[8];
+    const int per = (E + 31) / 32;
+    for (int i = 0; i < per; ++i) {
+        const int e = lane + 32 * i;
+        sg[i] = e < E ? 1.0f / (1.0f + expf(-logits[(size_t) t * E + e])) : 0.0f;
+        ch[i] = e < E ? sg[i] + bias[e] : -INFINITY;
+    }
+    if (ng > 1 && tg < ng) {
+        const int gsz = E / ng;
+        float gscore[32];
+        for (int gi = 0; gi < ng; ++gi) {   // the group's two largest s + bias, over the warp
+            float a = -INFINITY, b = -INFINITY;
+            for (int i = 0; i < per; ++i) {
+                const int e = lane + 32 * i;
+                if (e < E && e / gsz == gi) {
+                    if (ch[i] > a) {
+                        b = a;
+                        a = ch[i];
+                    } else if (ch[i] > b) {
+                        b = ch[i];
+                    }
+                }
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                const float oa = __shfl_xor_sync(0xffffffffu, a, o);
+                const float ob = __shfl_xor_sync(0xffffffffu, b, o);
+                const float hi = fmaxf(a, oa);
+                b = fmaxf(fminf(a, oa), fmaxf(b, ob));
+                a = hi;
+            }
+            gscore[gi] = a + b;
+        }
+        unsigned keep = 0;
+        for (int r = 0; r < tg; ++r) {
+            float bv = -INFINITY;
+            int bi = -1;
+            for (int gi = 0; gi < ng; ++gi)
+                if (!((keep >> gi) & 1u) && (bi < 0 || gscore[gi] > bv)) {
+                    bv = gscore[gi];
+                    bi = gi;
+                }
+            keep |= 1u << bi;
+        }
+        for (int i = 0; i < per; ++i) {
+            const int e = lane + 32 * i;
+            if (e < E && !((keep >> (e / gsz)) & 1u)) ch[i] = -INFINITY;
+        }
+    }
+    float ps = INFINITY;
+    int pi = -1;
+    float sum = 0.0f;
+    for (int r = 0; r < K; ++r) {
+        float bv = -INFINITY, bsg = 0.0f;
+        int bi = 0x7fffffff;
+        for (int i = 0; i < per; ++i) {
+            const int e = lane + 32 * i;
+            if (e < E && better(ps, pi, ch[i], e) && better(ch[i], e, bv, bi)) {
+                bv = ch[i];
+                bi = e;
+                bsg = sg[i];
+            }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            const float os = __shfl_xor_sync(0xffffffffu, bsg, o);
+            if (better(ov, oi, bv, bi)) {
+                bv = ov;
+                bi = oi;
+                bsg = os;
+            }
+        }
+        if (lane == 0) {
+            top[(size_t) t * K + r] = bi;
+            w[(size_t) t * K + r] = bsg;
+        }
+        sum += bsg;
+        ps = bv;
+        pi = bi;
+    }
+    __syncwarp();
+    if (lane < K) w[(size_t) t * K + lane] /= sum + 1e-20f;
+}
+
+template <int G>
+void beam_attn_g(const float* q, const uint16_t* kc, const uint16_t* vc, const KvQ& kq, const int* pos, int T, int Hq,
+                 int Hkv, int window, int ring, float scale, float* out, int S, float* part, cudaStream_t s) {
+    const dim3 grid((unsigned) T, (unsigned) Hkv, (unsigned) S);
+#define MM3_BEAM_ATTN(KF, VF)                                                                                          \
+    beam_attn_kernel<G, KF, VF><<<grid, 128, 0, s>>>(q, kc, vc, pos, Hq, Hkv, window, ring, scale, out, kq, S, part)
+    switch (kq.kf * 4 + kq.vf) {
+        case kKvBf16 * 4 + kKvBf16: MM3_BEAM_ATTN(kKvBf16, kKvBf16); break;
+        case kKvI8 * 4 + kKvI8: MM3_BEAM_ATTN(kKvI8, kKvI8); break;
+        case kKvI8 * 4 + kKvFp8: MM3_BEAM_ATTN(kKvI8, kKvFp8); break;
+        case kKvI8 * 4 + kKvFp4: MM3_BEAM_ATTN(kKvI8, kKvFp4); break;
+        case kKvFp8 * 4 + kKvFp8: MM3_BEAM_ATTN(kKvFp8, kKvFp8); break;
+        case kKvFp8 * 4 + kKvFp4: MM3_BEAM_ATTN(kKvFp8, kKvFp4); break;
+        case kKvFp4 * 4 + kKvFp4: MM3_BEAM_ATTN(kKvFp4, kKvFp4); break;
+        default: MM3_BEAM_ATTN(kKvBf16, kKvBf16); break;   // (beam_attn refuses the other pairs first)
+    }
+#undef MM3_BEAM_ATTN
+    if (S > 1) beam_combine_kernel<<<dim3((unsigned) T, (unsigned) Hkv, (unsigned) G), 128, 0, s>>>(
+        part, Hq, Hkv, G, S, kq.vf != kKvBf16 && (kq.rot & 2), out);
+}
+
+}  // namespace
+
+bool beam_kv_pair(int kf, int vf) {
+    return (kf == kKvBf16 && vf == kKvBf16) || (kf == kKvI8 && vf != kKvBf16) || (kf == kKvFp8 && vf >= kKvFp8) ||
+           (kf == kKvFp4 && vf == kKvFp4);
+}
+
+bool beam_attn(const float* q, const uint16_t* kc, const uint16_t* vc, const KvQ& kq, const int* pos, int T, int Hq,
+               int Hkv, int window, int ring, float scale, float* out, cudaStream_t s, int splits, float* part) {
+    if (T <= 0) return true;
+    if (Hkv <= 0 || Hq % Hkv != 0 || !beam_kv_pair(kq.kf, kq.vf)) return false;
+    const int S = part != nullptr ? std::max(1, std::min(splits, kBeamMaxSplits)) : 1;
+    switch (Hq / Hkv) {
+        case 4: beam_attn_g<4>(q, kc, vc, kq, pos, T, Hq, Hkv, window, ring, scale, out, S, part, s); break;
+        case 6: beam_attn_g<6>(q, kc, vc, kq, pos, T, Hq, Hkv, window, ring, scale, out, S, part, s); break;
+        case 8: beam_attn_g<8>(q, kc, vc, kq, pos, T, Hq, Hkv, window, ring, scale, out, S, part, s); break;
+        case 16: beam_attn_g<16>(q, kc, vc, kq, pos, T, Hq, Hkv, window, ring, scale, out, S, part, s); break;
+        default: return false;
+    }
+    check("beam_attn");
+    return true;
+}
+
+void beam_qscale(float* q, const int* pos, int T, int per_tok, float pw, float len, cudaStream_t s) {
+    if (T <= 0) return;
+    beam_qscale_kernel<<<T, 256, 0, s>>>(q, pos, per_tok, pw, len);
+    check("beam_qscale");
+}
+
+void beam_gate(float* att, const float* gl, const float* gb, int T, int Hq, int hd, cudaStream_t s) {
+    const size_t n = (size_t) T * Hq * hd;
+    if (n == 0) return;
+    beam_gate_kernel<<<grid_for(n), 256, 0, s>>>(att, gl, gb, n, Hq, hd);
+    check("beam_gate");
+}
+
+void beam_resid(float* h, const float* x, float a, float b, size_t n, cudaStream_t s) {
+    if (n == 0) return;
+    beam_resid_kernel<<<grid_for(n), 256, 0, s>>>(h, x, a, b, n);
+    check("beam_resid");
+}
+
+void beam_swiglu(const float* g, const float* u, size_t n, float* hf, uint16_t* h16, cudaStream_t s) {
+    if (n == 0) return;
+    beam_swiglu_kernel<<<grid_for(n), 256, 0, s>>>(g, u, n, hf, h16);
+    check("beam_swiglu");
+}
+
+void softcap(float* x, size_t n, float cap, cudaStream_t s) {
+    if (n == 0 || cap <= 0.0f) return;
+    softcap_kernel<<<grid_for(n), 256, 0, s>>>(x, n, cap);
+    check("softcap");
+}
+
+void beam_route(const float* logits, const float* bias, int T, int E, int K, int ng, int tg, int* top, float* w,
+                cudaStream_t s) {
+    if (T <= 0) return;
+    beam_route_kernel<<<(T + 7) / 8, 256, 0, s>>>(logits, bias, T, E, K, ng, tg, top, w);
+    check("beam_route");
 }
 
 }  // namespace mm3::k

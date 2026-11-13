@@ -29,7 +29,10 @@ inline float oai(float g, float u, float limit) {
     u = std::min(std::max(u, -limit), limit);
     return g / (1.0f + std::exp(-1.702f * g)) * (u + 1.0f);
 }
+bool g_plain = false;   // (gg_set_plain_swiglu: Beam's silu(g) u, unclamped)
 }  // namespace
+
+void gg_set_plain_swiglu(bool on) { g_plain = on; }
 
 bool gg_fmt(int tg, int tu, int td, int dim, int ff, GgFmt& f, std::string& err) {
     dg::IqCpu a, b;
@@ -132,7 +135,10 @@ void gg_run_multi(CpuLane& lane, int dim, int ff, float limit, const std::vector
     lane.parallel_for(N, [&](int j) {
         float* g = gu + (size_t) j * 2 * ff;
         const float* u = g + ff;
-        for (int i = 0; i < ff; ++i) g[i] = oai(g[i], u[i], limit);
+        if (g_plain)
+            for (int i = 0; i < ff; ++i) g[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
+        else
+            for (int i = 0; i < ff; ++i) g[i] = oai(g[i], u[i], limit);
         dg::iq_cpu_quant(f.act[2], g, ff, hq + (size_t) j * f.ab[2]);
     });
     // down rows: job (chunk, block of kRows rows)

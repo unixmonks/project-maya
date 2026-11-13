@@ -8,6 +8,9 @@
 //   x = rms(h) (1 + w');  layers 0-2: the dense swigluoai MLP;  else the router (F32 logits, sigmoid, + bias, top 4,
 //   renormalised), the routed experts (EXL3 sets: the resident ones in one pass, the staged ones in passes of the
 //   staging slots), the shared expert, h += 2.0 * routed + shared
+// Reflection Beam-1.0 (Geo::beam; a GGUF pack from tools/mm3/pack_beam_gguf.py) on the same placement and experts -
+// beam_front / beam_layer: attention over a sliding layer's last 512 positions (a ring) or a global layer's every one,
+// its output gated per head; the sandwich norms and the depth-scaled residual; the group-limited router; no shared expert
 #include "mm3_model.hpp"
 
 #include <cublas_v2.h>
@@ -113,6 +116,12 @@ struct Layer {
     // its blob's device address) - no wait for the routing, no round trip through the host
     bool hf = false;
     unsigned long long* exp_tab = nullptr;
+    // (Beam) the sandwich norms after the attention and after the MLP, the attention gate's projection and its per-head
+    // bias; a sliding layer: its K / V a ring of `ring` rows (0: a row a position)
+    float *pan1 = nullptr, *pfn1 = nullptr, *gb = nullptr;
+    x3::Mat ag;
+    bool swa = false;
+    int ring = 0;
 };
 
 struct Dev {
@@ -167,6 +176,7 @@ struct Dev {
     unsigned win_wait = 0;
     float *win_h = nullptr, *win_part = nullptr;
     float* attp = nullptr;               // a token's / a window's attention splits' partials (k::attn_part_floats)
+    float *gt = nullptr, *bpart = nullptr;   // (Beam) the gate's projection [chunk][Hq hd]; beam_attn's partials
     float* wtmp = nullptr;               // (Q8_0 indexer projections) the prompt path's F32 copy of one of them
     float* abl_r = nullptr;              // (--ablate) the direction projected out of each residual write (null: off)
     // scratch (chunk rows)
@@ -360,7 +370,7 @@ struct Model::Impl {
     bool gguf = false;   // (the pack's format: a GGUF's - tools/mm3/pack_gguf.py - else EXL3)
     // the RMSNorm weights' Gemma offset: the checkpoint stores w (the engine multiplies by 1 + w); llama.cpp's
     // converter writes w + 1 into a GGUF already - added once either way
-    float norm_add() const { return gguf ? 0.0f : 1.0f; }
+    float norm_add() const { return gguf || g.beam ? 0.0f : 1.0f; }   // (Beam's norms: the weight itself)
     std::vector<Layer> L;
     std::vector<Dev> D;
     std::vector<void*> owned;   // (cudaFree at exit, by device)
@@ -623,6 +633,11 @@ struct Model::Impl {
             l.lay.gg_type[r] = ty;
             l.lay.k2[r] = 0;
             off += up(bytes);
+        }
+        if (g.beam && l.lay.gg_type[0] != l.lay.gg_type[1]) {   // (the plain SwiGLU kernels: one pass, one type)
+            err = "Beam: layer " + std::to_string(li) + "'s experts' gate and up are of two types (" +
+                  pk.get(E + "0.w1.weight")->dtype + " / " + pk.get(E + "0.w3.weight")->dtype + ") - not covered";
+            return false;
         }
         l.lay.fmt = gg::kFmtGG;
         l.lay.cb = 0;
@@ -965,10 +980,18 @@ struct Model::Impl {
             // (the vision tower: no room - it stays in host memory, a picture's room lent by the staging slots)
             if (gguf) b += (double) gg::scratch_bytes();   // (the GGUF kernels' activations, FP16 bands, cuBLAS)
             if (gguf) b += 4.0 * g.ix_heads * g.ix_dim * g.dim;   // (wtmp: a Q8_0 indexer projection in F32)
+            if (g.beam)   // (the gate's projection, beam_attn's partials)
+                b += T * g.n_head * g.hd * 4.0 +
+                     4.0 * (double) k::beam_part_floats(kWin, g.n_kv, g.n_head / g.n_kv, k::kBeamMaxSplits);
             else if (x3::blas_wanted()) b += 0.2 * GB;
             return b;
         };
         auto kv_of = [&](size_t di, int ctx, int ring) {   // (--parallel: a cache for each conversation)
+            if (g.beam) {   // (a sliding layer's ring, a global layer's every position)
+                double b = 0;
+                for (int li : D[di].layers) b += (double) beam_kv_rows(li, ctx) * (double) kvpos;
+                return b;
+            }
             const double n = (double) D[di].layers.size() * (double) std::max(1, o.seqs);
             return n * ((double) (ring > 0 ? ring : ctx) * (double) kvpos + (double) ctx * (double) idxpos);
         };
@@ -988,7 +1011,7 @@ struct Model::Impl {
         const int want_ctx = o.max_ctx;
         int ctx = o.max_ctx, ring = kv_ring, slots = o.staging;
         std::string why;
-        if (!fits(ctx, ring, slots, &why) && ring == 0 && ctx > 32768 && o.seqs <= 1) {
+        if (!fits(ctx, ring, slots, &why) && ring == 0 && ctx > 32768 && o.seqs <= 1 && !g.beam) {
             ring = 32768;   // (KV streaming: the last 32768 positions a layer in VRAM, all of them in host memory)
             info.push_back("KV streaming on: the whole context's K / V do not fit beside the model (" + why + ")");
         }
@@ -1081,6 +1104,37 @@ struct Model::Impl {
                 o.dspark = false;
             }
         }
+        if (g.beam) {   // (Reflection Beam: a GGUF on the layer split, one conversation, text only)
+            if (!gguf) {
+                err = "Beam: a GGUF pack only (tools/mm3/pack_beam_gguf.py)";
+                return false;
+            }
+            if (o.seqs > 1 || !o.ablate.empty()) {
+                err = "Beam: --parallel and --ablate are not covered";
+                return false;
+            }
+            if (o.kv_resident > 0) {
+                o.kv_resident = 0;
+                info.push_back("NOTE: Beam: no KV streaming - the global layers' K / V in VRAM, the sliding layers' a ring");
+            }
+            if (o.dspark) {
+                o.dspark = false;
+                info.push_back("NOTE: Beam: no DSpark draft");
+            }
+            o.vision = false;
+            if (!k::beam_kv_pair(o.kv_k, o.kv_v)) {
+                err = std::string("Beam: --kv-cache ") + k::kv_name(o.kv_k) + " / " + k::kv_name(o.kv_v) + " not covered";
+                return false;
+            }
+            gg::set_plain_swiglu(true);
+            gg_set_plain_swiglu(true);
+            int nswa = 0;
+            for (int v : g.swa) nswa += v != 0;
+            info.push_back("Beam: " + std::to_string(g.n_layers - nswa) + " global layers, " + std::to_string(nswa) +
+                           " sliding (window " + std::to_string(g.window) + "), experts in " + std::to_string(g.n_group) +
+                           " groups (top " + std::to_string(g.topk_group) + "), logit softcap " +
+                           std::to_string((int) g.softcap));
+        }
         int ndev = 0;
         CK(cudaGetDeviceCount(&ndev));
         if (o.gpus.empty())
@@ -1122,7 +1176,9 @@ struct Model::Impl {
             for (int li = 0; li < g.n_layers && !old; ++li)
                 w[(size_t) li] = (double) dense_bytes(li) +
                                  (g.moe[(size_t) li] ? (double) g.n_exp * (double) blob_estimate(li) : 0.0) +
-                                 ns * (kvr * (double) k::kv_bytes(o.kv_k, o.kv_v, (size_t) g.n_kv) + ctx * g.ix_dim * 2.0);
+                                 ns * ((g.beam ? (double) beam_kv_rows(li, (int) ctx) : kvr) *
+                                           (double) k::kv_bytes(o.kv_k, o.kv_v, (size_t) g.n_kv) +
+                                       ctx * g.ix_dim * 2.0);
             double total = 0, wsum = 0;
             for (size_t i = 0; i < D.size(); ++i) {
                 cap[i] = (double) D[i].free0;
@@ -1225,16 +1281,25 @@ struct Model::Impl {
                 l.post1 = upload_f32(pk, N + "post_attention_layernorm.weight", norm_add(), ow, n, err);
                 l.qn1 = upload_f32(pk, AT + "q_norm.weight", norm_add(), ow, n, err);
                 l.kn1 = upload_f32(pk, AT + "k_norm.weight", norm_add(), ow, n, err);
-                l.iqn1 = upload_f32(pk, AT + "index_q_norm.weight", norm_add(), ow, n, err);
-                l.ikn1 = upload_f32(pk, AT + "index_k_norm.weight", norm_add(), ow, n, err);
-                if (q8_index(AT + "index_q_proj.weight") && q8_index(AT + "index_k_proj.weight")) {
-                    l.wiq8 = upload_raw(pk, AT + "index_q_proj.weight", ow, err);
-                    l.wik8 = upload_raw(pk, AT + "index_k_proj.weight", ow, err);
+                if (g.beam) {   // (no indexer; the sandwich norms, the attention gate)
+                    l.pan1 = upload_f32(pk, AT + "post_norm.weight", 0.0f, ow, n, err);
+                    l.pfn1 = upload_f32(pk, N + "mlp_post_norm.weight", 0.0f, ow, n, err);
+                    l.gb = upload_f32(pk, AT + "gate_bias", 0.0f, ow, n, err);
                     if (!err.empty()) return false;
-                    if (d.wtmp == nullptr && !A(d.wtmp, (size_t) std::max(g.ix_heads, 1) * g.ix_dim * g.dim)) return false;
+                    l.ag = upload_mat(pk, AT + "gate_proj", ow, err);
                 } else {
-                    l.wiq = upload_f32(pk, AT + "index_q_proj.weight", 0.0f, ow, n, err);
-                    l.wik = upload_f32(pk, AT + "index_k_proj.weight", 0.0f, ow, n, err);
+                    l.iqn1 = upload_f32(pk, AT + "index_q_norm.weight", norm_add(), ow, n, err);
+                    l.ikn1 = upload_f32(pk, AT + "index_k_norm.weight", norm_add(), ow, n, err);
+                    if (q8_index(AT + "index_q_proj.weight") && q8_index(AT + "index_k_proj.weight")) {
+                        l.wiq8 = upload_raw(pk, AT + "index_q_proj.weight", ow, err);
+                        l.wik8 = upload_raw(pk, AT + "index_k_proj.weight", ow, err);
+                        if (!err.empty()) return false;
+                        if (d.wtmp == nullptr && !A(d.wtmp, (size_t) std::max(g.ix_heads, 1) * g.ix_dim * g.dim))
+                            return false;
+                    } else {
+                        l.wiq = upload_f32(pk, AT + "index_q_proj.weight", 0.0f, ow, n, err);
+                        l.wik = upload_f32(pk, AT + "index_k_proj.weight", 0.0f, ow, n, err);
+                    }
                 }
                 if (!err.empty()) return false;
                 l.q = upload_mat(pk, AT + "q_proj", ow, err);
@@ -1247,9 +1312,11 @@ struct Model::Impl {
                     l.gate = upload_f32(pk, M + "gate.weight", 0.0f, ow, n, err);
                     l.bias = upload_f32(pk, M + "e_score_correction_bias", 0.0f, ow, n, err);
                     if (!err.empty()) return false;
-                    l.sg = upload_mat(pk, M + "shared_experts.gate_proj", ow, err);
-                    l.su = upload_mat(pk, M + "shared_experts.up_proj", ow, err);
-                    l.sd = upload_mat(pk, M + "shared_experts.down_proj", ow, err);
+                    if (!g.beam) {   // (Beam: no shared expert - sh stays zero)
+                        l.sg = upload_mat(pk, M + "shared_experts.gate_proj", ow, err);
+                        l.su = upload_mat(pk, M + "shared_experts.up_proj", ow, err);
+                        l.sd = upload_mat(pk, M + "shared_experts.down_proj", ow, err);
+                    }
                     if (!err.empty() || !expert_layout(l, li, err)) return false;
                     d.slot_bytes = std::max(d.slot_bytes, l.blob);
                     ++st.experts;
@@ -1264,7 +1331,12 @@ struct Model::Impl {
                     owned_dev.push_back(dv);
                 }
                 acat = kAKV;
-                const size_t kvrows = (size_t) (kv_ring > 0 ? kv_ring : o.max_ctx) * g.n_kv;
+                if (g.beam) {   // (a sliding layer: a ring of its window and a chunk, unless the context is no longer)
+                    l.swa = g.swa[(size_t) li] != 0;
+                    l.ring = l.swa && beam_kv_rows(li, o.max_ctx) < o.max_ctx ? beam_kv_rows(li, o.max_ctx) : 0;
+                }
+                const size_t kvrows =
+                    (size_t) (g.beam ? beam_kv_rows(li, o.max_ctx) : kv_ring > 0 ? kv_ring : o.max_ctx) * g.n_kv;
                 l.sk.resize((size_t) std::max(1, o.seqs));   // (--parallel: a cache each; the first one bound)
                 for (Layer::SeqKv& c : l.sk) {
                     uint8_t* kvb = nullptr;
@@ -1328,6 +1400,12 @@ struct Model::Impl {
             CK(cudaHostAlloc(&d.win_cpu, ((size_t) kWin * g.dim + kWin + 4) * 4, cudaHostAllocMapped | cudaHostAllocPortable));
             if (!A(d.win_h, (size_t) kWin * 8 * g.ff) || !A(d.win_part, (size_t) kWin * 8 * g.dim)) return false;
             if (attn_splits > 1 && !A(d.attp, k::attn_part_floats(kWin, g.n_kv, attn_splits))) return false;
+            if (g.beam) {
+                if (!A(d.gt, (size_t) T * g.n_head * g.hd) ||
+                    !A(d.bpart, k::beam_part_floats(kWin, g.n_kv, g.n_head / g.n_kv, k::kBeamMaxSplits)))
+                    return false;
+                CK(cudaMemset(d.sh, 0, (size_t) T * g.dim * 4));   // (no shared expert: the experts add zeros)
+            }
         }
         // KV streaming: every layer's whole cache in host memory (one pinned, mapped allocation, carved), written as the
         // VRAM ring is and read where the ring no longer holds a key
@@ -2033,7 +2111,7 @@ struct Model::Impl {
                 return false;
             }
             ablate(d, d.out, T);
-            k::add(d.h, d.out, (size_t) T * g.dim, d.s);
+            moe_out(l, d, d.out, T);
             pmark(d, kPExperts);
             return true;
         }
@@ -2142,7 +2220,7 @@ struct Model::Impl {
             *(volatile unsigned*) wait_word = d.win_wait;
         }
         ablate(d, d.out, T);
-        k::add(d.h, d.out, (size_t) T * g.dim, d.s);
+        moe_out(l, d, d.out, T);
         pmark(d, kPExperts);
         return true;
     }
@@ -2398,6 +2476,11 @@ struct Model::Impl {
         }
         join(d, !l.hf);
         pmark(d, kPRoute);
+        return token_experts(l, d, err);
+    }
+    // a token's MoE layer after its routing (d.top / d.w on the device; sh the shared expert's): the plan, the routed
+    // experts (VRAM, staging slots, the CPU lane), their sum into h (moe_out)
+    bool token_experts(Layer& l, Dev& d, std::string& err) {
         if (l.hf) {   // host-free: the plan made on the device (the host's values), nothing waited for
             const size_t lh = (size_t) (&l - L.data());
             if (!k::plan_dev(d.top, d.w, 1, g.k_exp, l.exp_tab, g.scale, d.plan_d, (float*) (d.plan_d + 8),
@@ -2417,7 +2500,7 @@ struct Model::Impl {
             x3::moe_gate_up(a, d.xn, nullptr, d.s);
             x3::moe_down(a, nullptr, d.sh, d.out, d.s);
             ablate(d, d.out, 1);
-            k::add(d.h, d.out, (size_t) g.dim, d.s);
+            moe_out(l, d, d.out, 1);
             pmark(d, kPExperts);
             return true;
         }
@@ -2490,7 +2573,7 @@ struct Model::Impl {
         }
         x3::moe_down(a, nullptr, d.sh, d.out, d.s);
         ablate(d, d.out, 1);
-        k::add(d.h, d.out, (size_t) g.dim, d.s);
+        moe_out(l, d, d.out, 1);
         pmark(d, kPExperts);
         // (the plan's pinned copy is rewritten by the next MoE layer of this GPU after its routing sync, which
         //  waits on this one's kernels)
@@ -2606,10 +2689,166 @@ struct Model::Impl {
         return true;
     }
 
+    // ---- Reflection Beam (Geo::beam)
+    // a layer's K / V rows: a sliding layer's ring (its window and a prompt chunk's own new keys), a global layer's
+    // every position
+    int beam_kv_rows(int li, int ctx) const {
+        return g.swa[(size_t) li] ? std::min(ctx, g.window + o.chunk) : ctx;
+    }
+    // the depth-scaled residual (transformers' depth_scaled_residual_add): step i = 2 (li + 1) for a layer's attention,
+    // one more for its MLP - h = x / sqrt(i) + h sqrt((i - 1) / i), x the sublayer's normed output
+    void beam_add(Dev& d, const float* x, int li, bool mlp, int T) {
+        const double i = 2.0 * (li + 1) + (mlp ? 1.0 : 0.0);
+        k::beam_resid(d.h, x, (float) (1.0 / std::sqrt(i)), (float) std::sqrt((i - 1.0) / i), (size_t) T * g.dim, d.s);
+    }
+    // an MLP's output y (a MoE layer's experts, Beam's dense MLP) into the residual stream: h += y - Beam's y normed
+    // (its post-MLP norm) and added depth-scaled
+    void moe_out(Layer& l, Dev& d, float* y, int T) {
+        if (!g.beam) {
+            k::add(d.h, y, (size_t) T * g.dim, d.s);
+            return;
+        }
+        k::rms(y, l.pfn1, T, g.dim, g.eps, y, nullptr, d.s);
+        beam_add(d, y, (int) (&l - L.data()), true, T);
+    }
+    // a token's or a window's attention splits: about 8 key tiles each, from the position's block (the decode graphs'
+    // key holds it); a prompt chunk's queries keep the GPU busy without
+    int beam_splits(const Layer& l, int T) const {
+        if (T > kWin) return 1;
+        int tiles = (cur_pos / g.blk + 1) * (g.blk / 64);
+        if (l.swa) tiles = std::min(tiles, g.window / 64 + 1);
+        return std::max(1, std::min(k::kBeamMaxSplits, (tiles + 7) / 8));
+    }
+    // a Beam layer's front: its attention - q, k, v and the gate's projection; the per-head norms, RoPE on a sliding
+    // layer, the NoPE query scale on a global one; K / V into the cache; the attention over the window or the context;
+    // the gate; o - normed and added depth-scaled; then the MLP's input norm and the dense MLP whole, or the router
+    // (d.top / d.w).  small: a token's or a window's GEMVs, else the prompt's FP16 GEMMs.
+    bool beam_front(Layer& l, Dev& d, int di, int T, bool small, std::string& err) {
+        const int Q = g.n_head * g.hd, KV = g.n_kv * g.hd;
+        const int li = (int) (&l - L.data());
+        const auto job = [&](const x3::Mat& m, const float* x, int ldx, float* y, int ldy) {
+            x3::MvJob j;
+            j.m = &m;
+            j.xf = x;
+            j.y = y;
+            j.ncol = T;
+            j.xf_cs = (size_t) ldx;
+            j.y_cs = (size_t) ldy;
+            return j;
+        };
+        k::rms(d.h, l.in1, T, g.dim, g.eps, d.xn, small ? nullptr : d.xn16, d.s);
+        if (small) {
+            const x3::MvJob p4[4] = {job(l.q, d.xn, g.dim, d.q, Q), job(l.k, d.xn, g.dim, d.k, KV),
+                                     job(l.v, d.xn, g.dim, d.v, KV), job(l.ag, d.xn, g.dim, d.gt, Q)};
+            if (!x3::mv(p4, 4, d.s)) {
+                err = "mv q/k/v/gate (Beam)";
+                return false;
+            }
+        } else {
+            x3::gemm_rows(l.q, d.xn16, g.dim, T, d.q, Q, 0.0f, d.s);
+            x3::gemm_rows(l.k, d.xn16, g.dim, T, d.k, KV, 0.0f, d.s);
+            x3::gemm_rows(l.v, d.xn16, g.dim, T, d.v, KV, 0.0f, d.s);
+            x3::gemm_rows(l.ag, d.xn16, g.dim, T, d.gt, Q, 0.0f, d.s);
+        }
+        k::qk_norm_rope(d.q, d.k, d.v, l.qn1, l.kn1, d.pos, T, g.n_head, g.n_kv, g.hd, l.swa ? g.n_rot : 0,
+                        inv_dev[(size_t) di], g.eps, l.kc, l.vc, d.s, l.ring, l.kvq);
+        if (!l.swa) k::beam_qscale(d.q, d.pos, T, Q, g.nope_pow, g.nope_len, d.s);
+        pmark(d, kPAttnIn);
+        const int S = beam_splits(l, T);
+        if (!k::beam_attn(d.q, l.kc, l.vc, l.kvq, d.pos, T, g.n_head, g.n_kv, l.swa ? g.window : 0, l.ring,
+                          1.0f / std::sqrt((float) g.hd), d.att, d.s, S, S > 1 ? d.bpart : nullptr)) {
+            err = "Beam attention: a geometry or K / V format not covered";
+            return false;
+        }
+        pmark(d, kPAttn);
+        k::beam_gate(d.att, d.gt, l.gb, T, g.n_head, g.hd, d.s);
+        if (small) {
+            const x3::MvJob oj = job(l.o, d.att, Q, d.ao, g.dim);
+            if (!x3::mv(&oj, 1, d.s)) {
+                err = "mv o (Beam)";
+                return false;
+            }
+        } else {
+            k::to_f16(d.att, T, Q, Q, d.att16, Q, d.s);
+            x3::gemm_rows(l.o, d.att16, Q, T, d.ao, g.dim, 0.0f, d.s);
+        }
+        k::rms(d.ao, l.pan1, T, g.dim, g.eps, d.ao, nullptr, d.s);
+        beam_add(d, d.ao, li, false, T);
+        pmark(d, kPOut);
+        k::rms(d.h, l.post1, T, g.dim, g.eps, d.xn, small ? nullptr : d.xn16, d.s);
+        if (!l.moe) {
+            if (small) {
+                const x3::MvJob gu[2] = {job(l.mg, d.xn, g.dim, d.g, g.ff_dense),
+                                         job(l.mu, d.xn, g.dim, d.u, g.ff_dense)};
+                if (!x3::mv(gu, 2, d.s)) {
+                    err = "mv dense gate/up (Beam)";
+                    return false;
+                }
+                k::beam_swiglu(d.g, d.u, (size_t) T * g.ff_dense, d.g, nullptr, d.s);
+                const x3::MvJob dj = job(l.md, d.g, g.ff_dense, d.ao, g.dim);
+                if (!x3::mv(&dj, 1, d.s)) {
+                    err = "mv dense down (Beam)";
+                    return false;
+                }
+            } else {
+                x3::gemm_rows(l.mg, d.xn16, g.dim, T, d.g, g.ff_dense, 0.0f, d.s);
+                x3::gemm_rows(l.mu, d.xn16, g.dim, T, d.u, g.ff_dense, 0.0f, d.s);
+                k::beam_swiglu(d.g, d.u, (size_t) T * g.ff_dense, nullptr, d.h16, d.s);
+                x3::gemm_rows(l.md, d.h16, g.ff_dense, T, d.ao, g.dim, 0.0f, d.s);
+            }
+            moe_out(l, d, d.ao, T);
+            pmark(d, kPDense);
+            return true;
+        }
+        if (small) {
+            k::rows_dot(l.gate, g.n_exp, g.dim, d.xn, T, d.logit, d.s);
+        } else {
+            const float one = 1.0f, zero = 0.0f;
+            CB(cublasSgemm(d.blas, CUBLAS_OP_T, CUBLAS_OP_N, g.n_exp, T, g.dim, &one, l.gate, g.dim, d.xn, g.dim,
+                           &zero, d.logit, g.n_exp));
+        }
+        k::beam_route(d.logit, l.bias, T, g.n_exp, g.k_exp, g.n_group, g.topk_group, d.top, d.w, d.s);
+        pmark(d, kPRoute);
+        return true;
+    }
+    // a Beam layer: its front, then (a MoE layer) the routed experts by the forward's path - a token's (token_experts),
+    // a window's (window_post), a prompt chunk's (experts, their weighted sum) - into the residual stream (moe_out)
+    bool beam_layer(Layer& l, Dev& d, int di, int T, std::string& err) {
+        const bool tok = T == 1 && o.fast_decode, win = !tok && T <= kWin && o.fast_decode;
+        if (!beam_front(l, d, di, T, tok || win, err)) return false;
+        if (!l.moe) return true;
+        if (tok) return token_experts(l, d, err);
+        if (win) {
+            if (!l.hf) {   // (the routing - and the CPU lane's rows - to the host, as window_pre's)
+                CK(cudaMemcpyAsync(d.win_rb, d.top, (size_t) T * g.k_exp * 4, cudaMemcpyDeviceToHost, d.s));
+                CK(cudaMemcpyAsync(d.win_rb + (size_t) kWin * 8 * 4, d.w, (size_t) T * g.k_exp * 4,
+                                   cudaMemcpyDeviceToHost, d.s));
+                if (lane)
+                    CK(cudaMemcpyAsync(d.win_rb + (size_t) kWin * 8 * 8, d.xn, (size_t) T * g.dim * 4,
+                                       cudaMemcpyDeviceToHost, d.s));
+            }
+            return window_post(l, d, T, err);
+        }
+        const int li = (int) (&l - L.data());
+        CK(cudaMemcpyAsync(d.top_h, d.top, (size_t) T * g.k_exp * 4, cudaMemcpyDeviceToHost, d.s));
+        CK(cudaStreamSynchronize(d.s));
+        const std::vector<int> top(d.top_h, d.top_h + (size_t) T * g.k_exp);
+        if (!routes_ok(top.data(), (int) top.size(), (size_t) li, err)) return false;
+        for (int e : top) ++prof[(size_t) li * g.n_exp + e];
+        st.profiled += (long) top.size();
+        pmark(d, kPSync);
+        if (!experts(l, d, T, top, err)) return false;
+        k::moe_combine(nullptr, d.y, d.invrow, d.w, d.sh, T, g.k_exp, g.dim, g.scale, d.out, d.s);
+        moe_out(l, d, d.out, T);
+        pmark(d, kPExperts);
+        return true;
+    }
+
     bool layer(int li, int T, int pmax, std::string& err) {
         Layer& l = L[(size_t) li];
         Dev& d = D[(size_t) l.dev];
         const int di = l.dev;
+        if (g.beam) return beam_layer(l, d, di, T, err);
         if (T == 1 && o.fast_decode && rseq.empty()) return layer_token(l, d, di, err);   // (rows: the window's)
         if (T <= kWin && o.fast_decode) return layer_window(l, d, di, T, err);
         // h += x W: the BLAS's beta 1; with hipBLASLt (beta 0 products only) or --ablate the product into ao, then the
@@ -2987,6 +3226,7 @@ struct Model::Impl {
                     return false;
                 }
             }
+            k::softcap(hd.lg, (size_t) RL * g.vocab, g.softcap, hd.s);
             CK(cudaMemcpyAsync(hd.lg_h, hd.lg, (size_t) RL * g.vocab * 4, cudaMemcpyDeviceToHost, hd.s));
         }
         for (Dev& d : D) {
@@ -3118,6 +3358,7 @@ struct Model::Impl {
                         return false;
                     }
                 }
+                k::softcap(hd.lg, (size_t) want * g.vocab, g.softcap, hd.s);   // (Beam's; 0: none)
             }
             return true;
         };
@@ -3136,6 +3377,7 @@ struct Model::Impl {
             for (int r0 = 0; r0 < want; r0 += kHeadRows) {
                 const int nr = std::min<int>(kHeadRows, want - r0);
                 x3::gemm_rows(head, hd.xn16 + (size_t) r0 * g.dim, g.dim, nr, hd.lg, g.vocab, 0.0f, hd.s);
+                k::softcap(hd.lg, (size_t) nr * g.vocab, g.softcap, hd.s);
                 CK(cudaMemcpyAsync(hd.lg_h, hd.lg, (size_t) nr * g.vocab * 4, cudaMemcpyDeviceToHost, hd.s));
                 CK(cudaStreamSynchronize(hd.s));
                 std::memcpy(logits + (size_t) r0 * g.vocab, hd.lg_h, (size_t) nr * g.vocab * 4);
@@ -3347,6 +3589,12 @@ int Model::vocab() const { return tpe ? tpe->vocab() : p->g.vocab; }
 int Model::max_ctx() const { return tpe ? tpe->max_ctx() : p->o.max_ctx; }
 int Model::bos() const { return tpe ? tpe->bos() : p->g.bos; }
 int Model::eos() const { return tpe ? tpe->eos() : p->g.eos; }
+const char* Model::model_name() const { return !tpe && p->g.beam ? "Beam-1.0-501B-A23B" : "MiniMax-M3.1-Flash"; }
+std::vector<int> Model::eos_ids() const {
+    std::vector<int> v{eos()};
+    if (!tpe && p->g.eos2 >= 0) v.push_back(p->g.eos2);
+    return v;
+}
 const Stats& Model::stats() const { return tpe ? tpe->stats() : p->st; }
 std::vector<std::string> Model::info_lines() const { return tpe ? tpe->info_lines() : p->info; }
 std::vector<std::string> Model::vram_lines() const { return tpe ? tpe->vram_lines() : p->vram; }
